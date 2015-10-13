@@ -1,0 +1,108 @@
+set -ex
+cwd=`pwd`
+builddir="$cwd/tinyipabuild"
+
+# Log into sudo so that it can be used throughout the script
+sudo -v
+
+# If an old build directory exists remove it
+if [ -d "$builddir" ]; then
+  sudo rm -rf $builddir
+fi
+
+# Download and cache required files from tinycorelinux
+cd $cwd/build_files
+wget -N http://distro.ibiblio.org/tinycorelinux/6.x/x86_64/release/distribution_files/corepure64.gz
+wget -N http://distro.ibiblio.org/tinycorelinux/6.x/x86_64/release/distribution_files/vmlinuz64
+cd $cwd
+
+# Make directory for building in
+mkdir $builddir
+
+# Extract rootfs from .gz file
+( cd $builddir && zcat $cwd/build_files/corepure64.gz | sudo cpio -i -H newc -d )
+
+# Create directory for python local mirror
+mkdir -p $builddir/tmp/localpip
+
+# Download get-pip into ramdisk
+( cd $builddir/tmp && wget https://bootstrap.pypa.io/get-pip.py )
+
+# Download IPA and requirements
+cd ../../.
+pip install --no-use-wheel --download $builddir/tmp/localpip -r requirements.txt
+cp requirements.txt $builddir/tmp/ipa.txt
+echo "ironic-python-agent" >> $builddir/tmp/ipa.txt
+rm -rf *.egg-info
+python setup.py sdist --dist-dir $builddir/tmp/localpip --quiet
+cd $cwd
+
+# Download setuptools
+pip install --no-use-wheel --download $builddir/tmp/localpip setuptools
+
+# Download pip
+pip install --no-use-wheel --download $builddir/tmp/localpip pip
+
+# Download wheel
+pip install --no-use-wheel --download $builddir/tmp/localpip wheel
+
+# Download virtualenv
+pip install --no-use-wheel --download $builddir/tmp/localpip virtualenv
+
+# Create directory for builtin extensions
+mkdir -p $builddir/tmp/builtin/optional
+
+# Copy onboot.lst to builtin
+cp $cwd/build_files/onboot.lst $builddir/tmp/builtin/.
+
+# Pull tinycore extensions and deps
+cd $builddir/tmp/builtin/optional
+
+# Download required tczs
+cat ../onboot.lst | sed "s/\(.*\)/http:\/\/distro\.ibiblio\.org\/tinycorelinux\/6\.x\/x86_64\/tcz\/\1/" | xargs wget -N -nv --progress=bar
+set +e
+ls *.tcz | sed "s/\(.*\)/http:\/\/distro\.ibiblio\.org\/tinycorelinux\/6\.x\/x86_64\/tcz\/\1.dep/" | xargs wget -N -q
+set -e
+
+# Install qemu utils
+cp $cwd/build_files/qemu-utils.* .
+echo "qemu-utils.tcz" >> ../onboot.lst
+
+# Install tgt
+cp $cwd/build_files/tgt.* .
+echo "tgt.tcz" >> ../onboot.lst
+
+# Get inital list of dependencies to pull
+files="`comm -23 <(awk 1 *.dep | sed -e "s/\s//" | grep -v ^$ | sort -u) <(ls *.tcz | sort -u)`"
+
+# Loop until all dependencies are satified
+while [ ! -z "$files" ]
+do
+  # Parse dep files and download missing tczs
+  awk 1 *.dep | grep -v ^$ | sort -u | sed "s/\(.*\)/http:\/\/distro\.ibiblio\.org\/tinycorelinux\/6\.x\/x86_64\/tcz\/\1/" | xargs wget -N --progress=bar 
+  # Pull dep files for downloaded tczs
+  set +e
+  ls *.tcz | sed "s/\(.*\)/http:\/\/distro\.ibiblio\.org\/tinycorelinux\/6\.x\/x86_64\/tcz\/\1.dep/" | xargs wget -N -q
+  set -e
+  files="`comm -23 <(awk 1 *.dep | sed -e "s/\s//" | grep -v ^$ | sort -u) <(ls *.tcz | sort -u)`"
+done
+cd $cwd
+
+
+# Copy bootlocal.sh to opt
+sudo cp $cwd/build_files/bootlocal.sh $builddir/opt/.
+
+# Disable ZSwap
+sudo sed -i '/# Main/a NOZSWAP=1' $builddir/etc/init.d/tc-config
+
+# Rebuild build directory into gz file
+( cd $builddir && sudo find | sudo cpio -o -H newc | gzip -2 > $cwd/tinyipa.gz )
+
+# Attempt to compress the gz more
+advdef -z4 $cwd/tinyipa.gz
+
+# Copy vmlinuz to new name
+cp $cwd/build_files/vmlinuz64 $cwd/tinyipa.vmlinuz
+
+# Remove builddir now that its been compressed
+# sudo rm -rf $builddir
